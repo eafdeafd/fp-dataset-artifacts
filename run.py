@@ -8,6 +8,7 @@ import json
 
 NUM_PREPROCESSING_WORKERS = 2
 
+# python3 run.py --do_train --task nli --dataset snli --output_dir ./trained_model/ --save_steps 1000 --save_total_limit 1 --load_best_model_at_end --logging_steps 1000 --per_device_train_batch_size 64 --evaluation_strategy steps
 
 def main():
     argp = HfArgumentParser(TrainingArguments)
