@@ -1,2 +1,7 @@
 *.pyc
 output/
+data/
+eval_output/
+wandb
+trained_model
+eval_model

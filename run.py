@@ -9,7 +9,8 @@ import json
 NUM_PREPROCESSING_WORKERS = 2
 
 # python3 run.py --do_train --task nli --dataset snli --output_dir ./trained_model/ --save_steps 1000 --save_total_limit 1 --load_best_model_at_end --logging_steps 1000 --per_device_train_batch_size 64 --evaluation_strategy steps
-
+# python3 run.py --do_train --task nli --dataset ./data/contrast+orig/train.tsv --output_dir ./trained_model/ --save_steps 500 --save_total_limit 1 --load_best_model_at_end --logging_steps 500 --per_device_train_batch_size 256 --evaluation_strategy steps --per_device_eval_batch_size 256
+# python3 run.py --do_eval --task nli --dataset data/contrast+orig/test.tsv --model ./trained_model/checkpoint-24000/ --output_dir ./eval_model/
 def main():
     argp = HfArgumentParser(TrainingArguments)
     # The HfArgumentParser object collects command-line arguments into an object (and provides default values for unspecified arguments).
@@ -47,7 +48,7 @@ def main():
                       help='Limit the number of examples to train on.')
     argp.add_argument('--max_eval_samples', type=int, default=None,
                       help='Limit the number of examples to evaluate on.')
-
+    argp.add_argument('--hard', type=bool, default=False)
     training_args, args = argp.parse_args_into_dataclasses()
 
     # Dataset selection
@@ -63,6 +64,31 @@ def main():
         # so if we want to use a jsonl file for evaluation we need to get the "train" split
         # from the loaded dataset
         eval_split = 'train'
+    elif args.dataset == ('contrast-set'):
+        # load it, preprocess, assumes no missing labels
+        def clean_data(dataset):
+            dataset = datasets.load_dataset('csv', data_files=args.dataset, delimiter='\t')
+            if args.hard:
+                dataset = dataset.filter(lambda example: example["captionID"] != "original")
+            print(dataset)
+            dataset = dataset.filter(lambda example: example["sentence1"] is not None and len(example["sentence1"]) > 0 and example["sentence2"] is not None and len(example["sentence2"]) > 0 and example["gold_label"] is not None)
+            print(dataset)
+            dataset = dataset.select_columns(['sentence1', 'sentence2', 'gold_label'])
+            dataset = dataset.rename_column('sentence1',  'premise')
+            dataset = dataset.rename_column('sentence2', 'hypothesis')
+            dataset = dataset.rename_column('gold_label', 'label')
+            label_map = {"contradiction": 2,
+                        "neutral": 1,
+                        "entailment": 0}
+            dataset = dataset.map(lambda example: {"label": label_map[example["label"]]})
+            dataset = dataset.cast_column("premise", datasets.Value(dtype='string', id='None'))
+            dataset = dataset.cast_column("hypothesis", datasets.Value(dtype='string', id='None'))
+            dataset = dataset.cast_column("label", datasets.Value(dtype='int64', id='None'))
+            return dataset
+        dataset_id = None
+        eval_split = 'train'
+
+        dataset = datasets.load_dataset('csv', data_files=args.dataset, delimiter='\t')
     else:
         default_datasets = {'qa': ('squad',), 'nli': ('snli',)}
         dataset_id = tuple(args.dataset.split(':')) if args.dataset is not None else \
@@ -76,6 +102,7 @@ def main():
     task_kwargs = {'num_labels': 3} if args.task == 'nli' else {}
 
     # Here we select the right model fine-tuning head
+
     model_classes = {'qa': AutoModelForQuestionAnswering,
                      'nli': AutoModelForSequenceClassification}
     model_class = model_classes[args.task]
