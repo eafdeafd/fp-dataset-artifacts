@@ -49,6 +49,7 @@ def main():
     argp.add_argument('--max_eval_samples', type=int, default=None,
                       help='Limit the number of examples to evaluate on.')
     argp.add_argument('--hard', type=bool, default=False)
+    argp.add_argument('--hypothesis_only', type=bool, default=False)
     training_args, args = argp.parse_args_into_dataclasses()
 
     # Dataset selection
@@ -67,28 +68,39 @@ def main():
     elif args.dataset == ('contrast-set'):
         # load it, preprocess, assumes no missing labels
         def clean_data(dataset):
-            dataset = datasets.load_dataset('csv', data_files=args.dataset, delimiter='\t')
             if args.hard:
                 dataset = dataset.filter(lambda example: example["captionID"] != "original")
-            print(dataset)
             dataset = dataset.filter(lambda example: example["sentence1"] is not None and len(example["sentence1"]) > 0 and example["sentence2"] is not None and len(example["sentence2"]) > 0 and example["gold_label"] is not None)
-            print(dataset)
-            dataset = dataset.select_columns(['sentence1', 'sentence2', 'gold_label'])
+            dataset = dataset.select_columns(['index', 'captionID', 'sentence1', 'sentence2', 'gold_label'])
             dataset = dataset.rename_column('sentence1',  'premise')
             dataset = dataset.rename_column('sentence2', 'hypothesis')
             dataset = dataset.rename_column('gold_label', 'label')
             label_map = {"contradiction": 2,
                         "neutral": 1,
                         "entailment": 0}
+            if args.hypothesis_only:
+                dataset = dataset.map(lambda example: {"premise":""})
             dataset = dataset.map(lambda example: {"label": label_map[example["label"]]})
             dataset = dataset.cast_column("premise", datasets.Value(dtype='string', id='None'))
             dataset = dataset.cast_column("hypothesis", datasets.Value(dtype='string', id='None'))
             dataset = dataset.cast_column("label", datasets.Value(dtype='int64', id='None'))
             return dataset
         dataset_id = None
-        eval_split = 'train'
-
-        dataset = datasets.load_dataset('csv', data_files=args.dataset, delimiter='\t')
+        if not training_args.do_train and training_args.do_eval:
+            eval_split = 'test'
+            data_files = {
+                "test": "./data/contrast+orig/test.tsv"
+            }
+        else:
+            eval_split = 'validation'
+            data_files = {
+                "train": "./data/contrast+orig/train.tsv",
+                "validation": "./data/contrast+orig/dev.tsv",
+                "test": "./data/contrast+orig/test.tsv"
+            }
+        dataset = datasets.load_dataset('csv', data_files=data_files, delimiter='\t')
+        for d in data_files:
+            dataset[d] = clean_data(dataset[d])
     else:
         default_datasets = {'qa': ('squad',), 'nli': ('snli',)}
         dataset_id = tuple(args.dataset.split(':')) if args.dataset is not None else \
