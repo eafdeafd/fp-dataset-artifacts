@@ -9,13 +9,14 @@ import torch
 import torch.nn as nn
 
 import wandb
-
-wandb.init(mode="disabled")           
+#wandb.init(mode="disabled")           
 NUM_PREPROCESSING_WORKERS = 2
 
 # python3 run.py --do_train --task nli --dataset snli --output_dir ./trained_model/ --save_steps 1000 --save_total_limit 1 --load_best_model_at_end --logging_steps 1000 --per_device_train_batch_size 64 --evaluation_strategy steps
 # python3 run.py --do_train --task nli --dataset ./data/contrast+orig/train.tsv --output_dir ./trained_model/ --save_steps 500 --save_total_limit 1 --load_best_model_at_end --logging_steps 500 --per_device_train_batch_size 256 --evaluation_strategy steps --per_device_eval_batch_size 256
 # python3 run.py --do_eval --task nli --dataset data/contrast+orig/test.tsv --model ./trained_model/checkpoint-24000/ --output_dir ./eval_model/
+# python3 run.py --do_train --task nli --dataset contrast-set --output_dir ./trained_model/debiased_snli --save_steps 500 --save_total_limit 1 --load_best_model_at_end --logging_steps 500 --per_device_train_batch_size 256 --evaluation_strategy steps --per_device_eval_batch_size 256  --original True --debias True --biased_model ./trained_model/hypothesis_only_snli/
+# python3 run.py --do_eval --task nli --dataset contrast-set --output_dir ./eval_model/debiased_snli --original True --model ./trained_model/debiased_snli/checkpoint-5500
 def main():
 
     argp = HfArgumentParser(TrainingArguments)
@@ -176,31 +177,39 @@ def main():
             num_proc=NUM_PREPROCESSING_WORKERS,
             remove_columns=eval_dataset.column_names
         )
+    
+    def preprocess_for_biased_model(input_ids, device):        
+        # Identify positions of the first and second [SEP] tokens
+        sep_positions = (input_ids == 102).to(device).long().cumsum(dim=1)
+        # We are interested in keeping everything after the first [SEP] token
+        # Hence, we create a mask that zeroes out everything up to and including the first [SEP] token
+        keep_mask = sep_positions >= 1
+        processed_input_ids = input_ids * keep_mask
+        processed_input_ids[:, 0] = 101
+        processed_input_ids = processed_input_ids.gather(1, (processed_input_ids == 0.0).to(device).long().sort(dim=1, stable=True)[1])
+        processed_input_ids.to(device)
+        return processed_input_ids
+    
     class ResidualTrainer(Trainer):
         def __init__(self, bias_model,*args, **kwargs):
             super().__init__(*args, **kwargs)
             self.biased_model = bias_model
-    
+
 
         def compute_loss(self, model, inputs, return_outputs=False):    
-            # get biased logits, remove premise from data
+            input_ids = inputs["input_ids"]
             self.biased_model.to(model.device)
             biased_inputs = inputs.copy()
-            for i in range(len(biased_inputs["input_ids"])):
-                item = biased_inputs["input_ids"][i]
-                sep = (item == 102).nonzero()[0]
-                hypothesis = torch.cat((torch.unsqueeze(item[0], dim=0), item[sep:]), dim=0)
-                hypothesis = torch.cat((hypothesis, torch.zeros(len(item) - len(hypothesis)).to(model.device)), dim=0)
-                biased_inputs["input_ids"][i] = hypothesis
+            biased_inputs["input_ids"] = preprocess_for_biased_model(biased_inputs["input_ids"], model.device)
             with torch.no_grad():
                 biased_logits = self.biased_model(**biased_inputs).get("logits")
-            # combine with residual logits
             out = model(**inputs)
             combined_logits = out.get("logits") + biased_logits
             labels = inputs['labels']
             lf = nn.CrossEntropyLoss()
             loss = lf(combined_logits.view(-1, self.model.config.num_labels), labels.view(-1))
             return (loss, out) if return_outputs else loss
+
 
     # Select the training configuration
     trainer_class = Trainer if not args.debias else ResidualTrainer
