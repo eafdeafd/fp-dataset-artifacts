@@ -5,13 +5,19 @@ from helpers import prepare_dataset_nli, prepare_train_dataset_qa, \
     prepare_validation_dataset_qa, QuestionAnsweringTrainer, compute_accuracy
 import os
 import json
+import torch
+import torch.nn as nn
 
+import wandb
+
+wandb.init(mode="disabled")           
 NUM_PREPROCESSING_WORKERS = 2
 
 # python3 run.py --do_train --task nli --dataset snli --output_dir ./trained_model/ --save_steps 1000 --save_total_limit 1 --load_best_model_at_end --logging_steps 1000 --per_device_train_batch_size 64 --evaluation_strategy steps
 # python3 run.py --do_train --task nli --dataset ./data/contrast+orig/train.tsv --output_dir ./trained_model/ --save_steps 500 --save_total_limit 1 --load_best_model_at_end --logging_steps 500 --per_device_train_batch_size 256 --evaluation_strategy steps --per_device_eval_batch_size 256
 # python3 run.py --do_eval --task nli --dataset data/contrast+orig/test.tsv --model ./trained_model/checkpoint-24000/ --output_dir ./eval_model/
 def main():
+
     argp = HfArgumentParser(TrainingArguments)
     # The HfArgumentParser object collects command-line arguments into an object (and provides default values for unspecified arguments).
     # In particular, TrainingArguments has several keys that you'll need/want to specify (when you call run.py from the command line):
@@ -50,6 +56,10 @@ def main():
                       help='Limit the number of examples to evaluate on.')
     argp.add_argument('--hard', type=bool, default=False)
     argp.add_argument('--hypothesis_only', type=bool, default=False)
+    argp.add_argument('--original', type=bool, default=False)
+    argp.add_argument('--debias', type=bool, default=False)
+    argp.add_argument('--biased_model', type=str, default='./trained_model/hypothesis_only_snli')
+
     training_args, args = argp.parse_args_into_dataclasses()
 
     # Dataset selection
@@ -70,6 +80,8 @@ def main():
         def clean_data(dataset):
             if args.hard:
                 dataset = dataset.filter(lambda example: example["captionID"] != "original")
+            if args.original:
+                dataset = dataset.filter(lambda example: example["captionID"] == "original")
             dataset = dataset.filter(lambda example: example["sentence1"] is not None and len(example["sentence1"]) > 0 and example["sentence2"] is not None and len(example["sentence2"]) > 0 and example["gold_label"] is not None)
             dataset = dataset.select_columns(['index', 'captionID', 'sentence1', 'sentence2', 'gold_label'])
             dataset = dataset.rename_column('sentence1',  'premise')
@@ -119,6 +131,8 @@ def main():
                      'nli': AutoModelForSequenceClassification}
     model_class = model_classes[args.task]
     # Initialize the model and tokenizer from the specified pretrained model/checkpoint
+    if args.debias:
+        biased_model = model_class.from_pretrained(args.biased_model, **task_kwargs)
     model = model_class.from_pretrained(args.model, **task_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
 
@@ -162,9 +176,34 @@ def main():
             num_proc=NUM_PREPROCESSING_WORKERS,
             remove_columns=eval_dataset.column_names
         )
+    class ResidualTrainer(Trainer):
+        def __init__(self, bias_model,*args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.biased_model = bias_model
+    
+
+        def compute_loss(self, model, inputs, return_outputs=False):    
+            # get biased logits, remove premise from data
+            self.biased_model.to(model.device)
+            biased_inputs = inputs.copy()
+            for i in range(len(biased_inputs["input_ids"])):
+                item = biased_inputs["input_ids"][i]
+                sep = (item == 102).nonzero()[0]
+                hypothesis = torch.cat((torch.unsqueeze(item[0], dim=0), item[sep:]), dim=0)
+                hypothesis = torch.cat((hypothesis, torch.zeros(len(item) - len(hypothesis)).to(model.device)), dim=0)
+                biased_inputs["input_ids"][i] = hypothesis
+            with torch.no_grad():
+                biased_logits = self.biased_model(**biased_inputs).get("logits")
+            # combine with residual logits
+            out = model(**inputs)
+            combined_logits = out.get("logits") + biased_logits
+            labels = inputs['labels']
+            lf = nn.CrossEntropyLoss()
+            loss = lf(combined_logits.view(-1, self.model.config.num_labels), labels.view(-1))
+            return (loss, out) if return_outputs else loss
 
     # Select the training configuration
-    trainer_class = Trainer
+    trainer_class = Trainer if not args.debias else ResidualTrainer
     eval_kwargs = {}
     # If you want to use custom metrics, you should define your own "compute_metrics" function.
     # For an example of a valid compute_metrics function, see compute_accuracy in helpers.py.
@@ -188,16 +227,28 @@ def main():
         nonlocal eval_predictions
         eval_predictions = eval_preds
         return compute_metrics(eval_preds)
+    
 
     # Initialize the Trainer object with the specified arguments and the model and dataset we loaded above
-    trainer = trainer_class(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset_featurized,
-        eval_dataset=eval_dataset_featurized,
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics_and_store_predictions
-    )
+    if not args.debias:
+        trainer = trainer_class(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset_featurized,
+            eval_dataset=eval_dataset_featurized,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics_and_store_predictions,
+        )
+    else:
+        trainer = trainer_class(
+            bias_model=biased_model,
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset_featurized,
+            eval_dataset=eval_dataset_featurized,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics_and_store_predictions,
+        )
     # Train and/or evaluate
     if training_args.do_train:
         trainer.train()
